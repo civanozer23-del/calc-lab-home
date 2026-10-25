@@ -15,9 +15,7 @@
 #define STUDENT_ID "251ADB130"
 
 typedef struct {
-    int is_float;
     long long i;
-    double f;
 } Value;
 
 typedef struct {
@@ -29,14 +27,8 @@ typedef struct {
 } Parser;
 
 /*
- * AI (ChatGPT), prompt:
- * "Help me implement the RTU Arithmetic Parser lab in C step by step,
- * using recursive descent parsing and following the assignment rules."
- *
- * Positions in the parser are zero-based indexes into the complete file.
- * The assignment requires one-based positions, so set_error adds 1.
- * If an operand is missing at the end of a line, p->end + 1 points to
- * the newline, or to file length + 1 when the last line has no newline.
+ * AI (ChatGPT): helped design the recursive-descent parser
+ * and exact error-position tracking.
  */
 static void set_error(Parser *p, size_t index) {
     if (!p->has_error) {
@@ -54,18 +46,15 @@ static void set_end_error(Parser *p) {
 
 static void skip_spaces(Parser *p) {
     while (p->pos < p->end &&
-           (p->text[p->pos] == ' ' || p->text[p->pos] == '\t')) {
+           (p->text[p->pos] == ' ' ||
+            p->text[p->pos] == '\t')) {
         p->pos++;
     }
 }
 
-static Value make_int(long long x) {
+static Value make_int(long long value) {
     Value v;
-
-    v.is_float = 0;
-    v.i = x;
-    v.f = (double)x;
-
+    v.i = value;
     return v;
 }
 
@@ -86,7 +75,9 @@ static Value parse_number(Parser *p) {
 
     while (p->pos < p->end &&
            isdigit((unsigned char)p->text[p->pos])) {
-        value = value * 10 + (p->text[p->pos] - '0');
+        value = value * 10 +
+                (p->text[p->pos] - '0');
+
         p->pos++;
     }
 
@@ -94,15 +85,72 @@ static Value parse_number(Parser *p) {
 }
 
 /*
- * At this stage the grammar is:
+ * term handles * and / before expr handles + and -.
+ * This gives multiplication and division higher precedence.
+ */
+static Value parse_term(Parser *p) {
+    Value result = parse_number(p);
+
+    if (p->has_error) {
+        return result;
+    }
+
+    while (1) {
+        skip_spaces(p);
+
+        if (p->pos >= p->end) {
+            break;
+        }
+
+        char op = p->text[p->pos];
+
+        if (op != '*' && op != '/') {
+            break;
+        }
+
+        p->pos++;
+
+        skip_spaces(p);
+
+        /*
+         * Division by zero must report the start of
+         * the right operand.
+         */
+        size_t right_start = p->pos;
+
+        Value right = parse_number(p);
+
+        if (p->has_error) {
+            return result;
+        }
+
+        if (op == '*') {
+            result.i *= right.i;
+        } else {
+            if (right.i == 0) {
+                set_error(p, right_start);
+                return result;
+            }
+
+            /*
+             * C integer division truncates toward zero,
+             * which matches the assignment rules.
+             */
+            result.i /= right.i;
+        }
+    }
+
+    return result;
+}
+
+/*
+ * Grammar currently:
  *
- * expression := number { ('+' | '-') number }
- *
- * This is enough for grades 4 and 5. More precedence levels will be
- * added later for *, /, parentheses and **.
+ * expr := term { ('+' | '-') term }
+ * term := number { ('*' | '/') number }
  */
 static Value parse_expr(Parser *p) {
-    Value result = parse_number(p);
+    Value result = parse_term(p);
 
     if (p->has_error) {
         return result;
@@ -123,7 +171,7 @@ static Value parse_expr(Parser *p) {
 
         p->pos++;
 
-        Value right = parse_number(p);
+        Value right = parse_term(p);
 
         if (p->has_error) {
             return result;
@@ -134,8 +182,6 @@ static Value parse_expr(Parser *p) {
         } else {
             result.i -= right.i;
         }
-
-        result.f = (double)result.i;
     }
 
     return result;
@@ -164,11 +210,8 @@ static const char *base_name(const char *path) {
 }
 
 /*
- * AI (ChatGPT), prompt:
- * "How can I read a whole file in C without assuming a fixed line length?"
- *
- * The buffer grows geometrically with realloc. This avoids a fixed
- * line-size limit and avoids repeatedly copying the whole file.
+ * AI (ChatGPT): suggested growing a buffer with realloc
+ * so the program does not depend on a fixed line/file size.
  */
 static char *read_entire_file(FILE *file, size_t *length) {
     size_t capacity = 8192;
@@ -183,7 +226,9 @@ static char *read_entire_file(FILE *file, size_t *length) {
     while (1) {
         if (used == capacity) {
             size_t new_capacity = capacity * 2;
-            char *new_data = realloc(data, new_capacity + 1);
+
+            char *new_data =
+                realloc(data, new_capacity + 1);
 
             if (new_data == NULL) {
                 free(data);
@@ -220,8 +265,14 @@ static char *read_entire_file(FILE *file, size_t *length) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 4 || strcmp(argv[1], "-o") != 0) {
-        fprintf(stderr, "Usage: calc -o OUTDIR input.txt\n");
+    if (argc != 4 ||
+        strcmp(argv[1], "-o") != 0) {
+
+        fprintf(
+            stderr,
+            "Usage: calc -o OUTDIR input.txt\n"
+        );
+
         return 1;
     }
 
@@ -231,33 +282,55 @@ int main(int argc, char *argv[]) {
     FILE *in = fopen(input_path, "rb");
 
     if (in == NULL) {
-        fprintf(stderr, "Cannot open input file.\n");
+        fprintf(
+            stderr,
+            "Cannot open input file.\n"
+        );
+
         return 1;
     }
 
     size_t file_length = 0;
-    char *file_data = read_entire_file(in, &file_length);
+
+    char *file_data =
+        read_entire_file(in, &file_length);
 
     fclose(in);
 
     if (file_data == NULL) {
-        fprintf(stderr, "Cannot read input file.\n");
+        fprintf(
+            stderr,
+            "Cannot read input file.\n"
+        );
+
         return 1;
     }
 
     if (!ensure_directory(outdir)) {
-        fprintf(stderr, "Cannot create output directory.\n");
+        fprintf(
+            stderr,
+            "Cannot create output directory.\n"
+        );
+
         free(file_data);
         return 1;
     }
 
-    const char *filename = base_name(input_path);
+    const char *filename =
+        base_name(input_path);
 
-    size_t base_length = strlen(filename) + 1;
-    char *input_base = malloc(base_length);
+    size_t base_length =
+        strlen(filename) + 1;
+
+    char *input_base =
+        malloc(base_length);
 
     if (input_base == NULL) {
-        fprintf(stderr, "Memory allocation failed.\n");
+        fprintf(
+            stderr,
+            "Memory allocation failed.\n"
+        );
+
         free(file_data);
         return 1;
     }
@@ -266,7 +339,8 @@ int main(int argc, char *argv[]) {
 
     char *dot = strrchr(input_base, '.');
 
-    if (dot != NULL && strcmp(dot, ".txt") == 0) {
+    if (dot != NULL &&
+        strcmp(dot, ".txt") == 0) {
         *dot = '\0';
     }
 
@@ -278,12 +352,18 @@ int main(int argc, char *argv[]) {
         strlen(STUDENT_ID) +
         10;
 
-    char *output_path = malloc(output_length);
+    char *output_path =
+        malloc(output_length);
 
     if (output_path == NULL) {
-        fprintf(stderr, "Memory allocation failed.\n");
+        fprintf(
+            stderr,
+            "Memory allocation failed.\n"
+        );
+
         free(input_base);
         free(file_data);
+
         return 1;
     }
 
@@ -303,9 +383,14 @@ int main(int argc, char *argv[]) {
     FILE *out = fopen(output_path, "w");
 
     if (out == NULL) {
-        fprintf(stderr, "Cannot open output file.\n");
+        fprintf(
+            stderr,
+            "Cannot open output file.\n"
+        );
+
         free(output_path);
         free(file_data);
+
         return 1;
     }
 
@@ -338,10 +423,11 @@ int main(int argc, char *argv[]) {
             skip_spaces(&p);
 
             /*
-             * If parsing stopped before the end, the current character is
-             * the first unexpected token, so its position is the error.
+             * If something remains after a valid expression,
+             * that character is the first unexpected token.
              */
-            if (!p.has_error && p.pos < p.end) {
+            if (!p.has_error &&
+                p.pos < p.end) {
                 set_error(&p, p.pos);
             }
 
@@ -349,19 +435,27 @@ int main(int argc, char *argv[]) {
                 fclose(out);
 
                 /*
-                 * An error anywhere in the input invalidates every previous
-                 * result, so reopen with "w" to erase partial output.
+                 * Any error means previous results must disappear.
                  */
                 out = fopen(output_path, "w");
 
                 if (out == NULL) {
-                    fprintf(stderr, "Cannot write output file.\n");
+                    fprintf(
+                        stderr,
+                        "Cannot write output file.\n"
+                    );
+
                     free(output_path);
                     free(file_data);
+
                     return 1;
                 }
 
-                fprintf(out, "ERROR:%zu\n", p.error_pos);
+                fprintf(
+                    out,
+                    "ERROR:%zu\n",
+                    p.error_pos
+                );
 
                 fclose(out);
                 free(output_path);
@@ -370,13 +464,20 @@ int main(int argc, char *argv[]) {
                 return 0;
             }
 
-            fprintf(out, "%lld\n", result.i);
+            fprintf(
+                out,
+                "%lld\n",
+                result.i
+            );
         }
 
         if (line_end < file_length &&
             file_data[line_end] == '\n') {
+
             line_start = line_end + 1;
+
         } else {
+
             line_start = line_end;
         }
     }

@@ -40,12 +40,6 @@ static void set_error(Parser *p, size_t index) {
 static void set_end_error(Parser *p) {
     if (!p->has_error) {
         p->has_error = 1;
-
-        /*
-         * p->end is the newline index when a newline exists.
-         * end + 1 therefore gives the required 1-based position.
-         * If the last line has no newline, this is file length + 1.
-         */
         p->error_pos = p->end + 1;
     }
 }
@@ -64,10 +58,6 @@ static Value make_int(long long value) {
     return v;
 }
 
-/*
- * Forward declaration because primary() may contain a complete
- * expression inside parentheses.
- */
 static Value parse_expr(Parser *p);
 
 static Value parse_number(Parser *p) {
@@ -98,13 +88,7 @@ static Value parse_number(Parser *p) {
 }
 
 /*
- * AI (ChatGPT): prompt about adding parentheses to a recursive-descent
- * arithmetic parser.
- *
  * primary := NUMBER | '(' expr ')'
- *
- * Parentheses call parse_expr again, which naturally supports nested
- * parentheses without changing operator precedence.
  */
 static Value parse_primary(Parser *p) {
     skip_spaces(p);
@@ -125,10 +109,6 @@ static Value parse_primary(Parser *p) {
 
         skip_spaces(p);
 
-        /*
-         * Reaching the end while waiting for ')' means the error
-         * belongs to the line's newline, or file length + 1.
-         */
         if (p->pos >= p->end) {
             set_end_error(p);
             return result;
@@ -147,17 +127,83 @@ static Value parse_primary(Parser *p) {
 }
 
 /*
- * Grammar through Grade 7:
+ * Integer exponentiation by repeated squaring.
+ * The assignment states that integer tests do not overflow.
+ */
+static long long integer_power(long long base, long long exponent) {
+    long long result = 1;
+
+    while (exponent > 0) {
+        if (exponent % 2 == 1) {
+            result *= base;
+        }
+
+        base *= base;
+        exponent /= 2;
+    }
+
+    return result;
+}
+
+/*
+ * AI (ChatGPT): prompt about implementing right-associative **.
  *
- * expr    := term { ('+' | '-') term }
- * term    := primary { ('*' | '/') primary }
- * primary := NUMBER | '(' expr ')'
+ * power := primary [ '**' power ]
  *
- * Because term() is evaluated inside expr(), multiplication and
- * division have higher precedence than addition and subtraction.
+ * power() calls itself for the exponent, therefore:
+ * 2 ** 3 ** 2
+ * becomes:
+ * 2 ** (3 ** 2)
+ *
+ * rather than:
+ * (2 ** 3) ** 2
+ */
+static Value parse_power(Parser *p) {
+    Value left = parse_primary(p);
+
+    if (p->has_error) {
+        return left;
+    }
+
+    skip_spaces(p);
+
+    if (p->pos + 1 < p->end &&
+        p->text[p->pos] == '*' &&
+        p->text[p->pos + 1] == '*') {
+
+        p->pos += 2;
+
+        skip_spaces(p);
+
+        /*
+         * Negative exponent errors are reported at the start
+         * of the exponent expression.
+         */
+        size_t exponent_start = p->pos;
+
+        Value right = parse_power(p);
+
+        if (p->has_error) {
+            return left;
+        }
+
+        if (right.i < 0) {
+            set_error(p, exponent_start);
+            return left;
+        }
+
+        left.i = integer_power(left.i, right.i);
+    }
+
+    return left;
+}
+
+/*
+ * term handles ordinary * and /.
+ * '**' is deliberately left for parse_power().
  */
 static Value parse_term(Parser *p) {
-    Value result = parse_primary(p);
+    Value result = parse_power(p);
 
     if (p->has_error) {
         return result;
@@ -167,6 +213,15 @@ static Value parse_term(Parser *p) {
         skip_spaces(p);
 
         if (p->pos >= p->end) {
+            break;
+        }
+
+        /*
+         * Do not consume the first '*' of '**'.
+         */
+        if (p->pos + 1 < p->end &&
+            p->text[p->pos] == '*' &&
+            p->text[p->pos + 1] == '*') {
             break;
         }
 
@@ -180,13 +235,9 @@ static Value parse_term(Parser *p) {
 
         skip_spaces(p);
 
-        /*
-         * Division-by-zero errors are reported at the start
-         * of the right operand.
-         */
         size_t right_start = p->pos;
 
-        Value right = parse_primary(p);
+        Value right = parse_power(p);
 
         if (p->has_error) {
             return result;
@@ -200,10 +251,6 @@ static Value parse_term(Parser *p) {
                 return result;
             }
 
-            /*
-             * C integer division truncates toward zero,
-             * exactly as required by the assignment.
-             */
             result.i /= right.i;
         }
     }
@@ -211,6 +258,14 @@ static Value parse_term(Parser *p) {
     return result;
 }
 
+/*
+ * Full grammar through Grade 8:
+ *
+ * expr    := term  { ('+' | '-') term }
+ * term    := power { ('*' | '/') power }
+ * power   := primary [ '**' power ]
+ * primary := NUMBER | '(' expr ')'
+ */
 static Value parse_expr(Parser *p) {
     Value result = parse_term(p);
 
@@ -272,8 +327,8 @@ static const char *base_name(const char *path) {
 }
 
 /*
- * AI (ChatGPT): suggested growing the input buffer geometrically
- * with realloc so the program is not limited to fixed-size lines.
+ * AI (ChatGPT): suggested a geometrically growing realloc buffer
+ * so the input is not limited by a fixed line length.
  */
 static char *read_entire_file(FILE *file, size_t *length) {
     size_t capacity = 8192;
@@ -478,15 +533,21 @@ int main(int argc, char *argv[]) {
 
         /*
          * Blank lines produce no output.
+         *
+         * A line whose first non-blank character is '#'
+         * is a comment and is ignored completely.
          */
-        if (p.pos < p.end) {
+        if (p.pos < p.end &&
+            file_data[p.pos] != '#') {
+
             Value result = parse_expr(&p);
 
             skip_spaces(&p);
 
             /*
-             * Anything remaining after a complete expression,
-             * including an extra ')', is an error at that token.
+             * A '#' here is not a comment because it was not
+             * the first non-blank character. It therefore becomes
+             * an invalid token at its exact position.
              */
             if (!p.has_error &&
                 p.pos < p.end) {
@@ -496,9 +557,6 @@ int main(int argc, char *argv[]) {
             if (p.has_error) {
                 fclose(out);
 
-                /*
-                 * One error invalidates every earlier result.
-                 */
                 out = fopen(output_path, "w");
 
                 if (out == NULL) {

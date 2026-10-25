@@ -27,8 +27,8 @@ typedef struct {
 } Parser;
 
 /*
- * AI (ChatGPT): helped design the recursive-descent parser
- * and exact error-position tracking.
+ * AI (ChatGPT): helped design the recursive-descent parser,
+ * precedence structure and exact error-position tracking.
  */
 static void set_error(Parser *p, size_t index) {
     if (!p->has_error) {
@@ -40,6 +40,12 @@ static void set_error(Parser *p, size_t index) {
 static void set_end_error(Parser *p) {
     if (!p->has_error) {
         p->has_error = 1;
+
+        /*
+         * p->end is the newline index when a newline exists.
+         * end + 1 therefore gives the required 1-based position.
+         * If the last line has no newline, this is file length + 1.
+         */
         p->error_pos = p->end + 1;
     }
 }
@@ -58,6 +64,12 @@ static Value make_int(long long value) {
     return v;
 }
 
+/*
+ * Forward declaration because primary() may contain a complete
+ * expression inside parentheses.
+ */
+static Value parse_expr(Parser *p);
+
 static Value parse_number(Parser *p) {
     skip_spaces(p);
 
@@ -75,6 +87,7 @@ static Value parse_number(Parser *p) {
 
     while (p->pos < p->end &&
            isdigit((unsigned char)p->text[p->pos])) {
+
         value = value * 10 +
                 (p->text[p->pos] - '0');
 
@@ -85,11 +98,66 @@ static Value parse_number(Parser *p) {
 }
 
 /*
- * term handles * and / before expr handles + and -.
- * This gives multiplication and division higher precedence.
+ * AI (ChatGPT): prompt about adding parentheses to a recursive-descent
+ * arithmetic parser.
+ *
+ * primary := NUMBER | '(' expr ')'
+ *
+ * Parentheses call parse_expr again, which naturally supports nested
+ * parentheses without changing operator precedence.
+ */
+static Value parse_primary(Parser *p) {
+    skip_spaces(p);
+
+    if (p->pos >= p->end) {
+        set_end_error(p);
+        return make_int(0);
+    }
+
+    if (p->text[p->pos] == '(') {
+        p->pos++;
+
+        Value result = parse_expr(p);
+
+        if (p->has_error) {
+            return result;
+        }
+
+        skip_spaces(p);
+
+        /*
+         * Reaching the end while waiting for ')' means the error
+         * belongs to the line's newline, or file length + 1.
+         */
+        if (p->pos >= p->end) {
+            set_end_error(p);
+            return result;
+        }
+
+        if (p->text[p->pos] != ')') {
+            set_error(p, p->pos);
+            return result;
+        }
+
+        p->pos++;
+        return result;
+    }
+
+    return parse_number(p);
+}
+
+/*
+ * Grammar through Grade 7:
+ *
+ * expr    := term { ('+' | '-') term }
+ * term    := primary { ('*' | '/') primary }
+ * primary := NUMBER | '(' expr ')'
+ *
+ * Because term() is evaluated inside expr(), multiplication and
+ * division have higher precedence than addition and subtraction.
  */
 static Value parse_term(Parser *p) {
-    Value result = parse_number(p);
+    Value result = parse_primary(p);
 
     if (p->has_error) {
         return result;
@@ -113,12 +181,12 @@ static Value parse_term(Parser *p) {
         skip_spaces(p);
 
         /*
-         * Division by zero must report the start of
-         * the right operand.
+         * Division-by-zero errors are reported at the start
+         * of the right operand.
          */
         size_t right_start = p->pos;
 
-        Value right = parse_number(p);
+        Value right = parse_primary(p);
 
         if (p->has_error) {
             return result;
@@ -134,7 +202,7 @@ static Value parse_term(Parser *p) {
 
             /*
              * C integer division truncates toward zero,
-             * which matches the assignment rules.
+             * exactly as required by the assignment.
              */
             result.i /= right.i;
         }
@@ -143,12 +211,6 @@ static Value parse_term(Parser *p) {
     return result;
 }
 
-/*
- * Grammar currently:
- *
- * expr := term { ('+' | '-') term }
- * term := number { ('*' | '/') number }
- */
 static Value parse_expr(Parser *p) {
     Value result = parse_term(p);
 
@@ -210,8 +272,8 @@ static const char *base_name(const char *path) {
 }
 
 /*
- * AI (ChatGPT): suggested growing a buffer with realloc
- * so the program does not depend on a fixed line/file size.
+ * AI (ChatGPT): suggested growing the input buffer geometrically
+ * with realloc so the program is not limited to fixed-size lines.
  */
 static char *read_entire_file(FILE *file, size_t *length) {
     size_t capacity = 8192;
@@ -423,8 +485,8 @@ int main(int argc, char *argv[]) {
             skip_spaces(&p);
 
             /*
-             * If something remains after a valid expression,
-             * that character is the first unexpected token.
+             * Anything remaining after a complete expression,
+             * including an extra ')', is an error at that token.
              */
             if (!p.has_error &&
                 p.pos < p.end) {
@@ -435,7 +497,7 @@ int main(int argc, char *argv[]) {
                 fclose(out);
 
                 /*
-                 * Any error means previous results must disappear.
+                 * One error invalidates every earlier result.
                  */
                 out = fopen(output_path, "w");
 
